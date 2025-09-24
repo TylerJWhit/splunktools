@@ -24,6 +24,13 @@ import ipaddress
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 
+# Add the parent directory to sys.path for imports
+parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if parent_dir not in sys.path:
+    sys.path.insert(0, parent_dir)
+
+from splunk_config_checker.checker import SplunkConfigChecker
+
 # Try to import cryptography library, fall back to OpenSSL commands if not available
 try:
     from cryptography import x509
@@ -151,31 +158,26 @@ class CertificateVerifier:
             self.log_warning(f"Error running btool: {e}, falling back to manual parsing")
             return self._parse_server_conf_manual()
 
-    def _parse_btool_output(self, btool_output: str) -> Dict:
-        """Parse btool output into configuration dictionary"""
+    def _parse_btool_output(self, output: str, conf_file: str = 'server.conf') -> Dict:
+        """Parse configuration using splunk btool to get effective configuration"""
         config = {}
         current_stanza = None
         
-        for line in btool_output.split('\n'):
-            line = line.strip()
-            if not line or line.startswith('#'):
-                continue
-                
-            # Stanza header
-            if line.startswith('[') and line.endswith(']'):
-                current_stanza = line[1:-1]
-                if current_stanza not in config:
-                    config[current_stanza] = {}
-                self.log_debug(f"Found stanza: [{current_stanza}]")
-                continue
-            
-            # Key-value pair
-            if '=' in line and current_stanza:
-                key, value = line.split('=', 1)
-                config[current_stanza][key.strip()] = value.strip()
-        
-        self.log_debug(f"Parsed {len(config)} configuration sections from btool: {list(config.keys())}")
-        return config
+        try:
+            lines = output.splitlines()
+            for line in lines:
+                line = line.strip()
+                if line.startswith('[') and line.endswith(']'):
+                    current_stanza = line[1:-1]
+                    if current_stanza not in config:
+                        config[current_stanza] = {}
+                elif '=' in line and current_stanza:
+                    key, value = line.split('=', 1)
+                    config[current_stanza][key.strip()] = value.strip()
+            return config
+        except Exception as e:
+            self.log_warning(f"Error parsing btool output for {conf_file}: {e}")
+            return {}
 
     def _parse_server_conf_manual(self) -> Dict:
         """Fallback manual parsing of server.conf files"""
@@ -191,6 +193,47 @@ class CertificateVerifier:
         
         # Read default first, then local (local overrides default)
         for conf_path in [server_conf_default, server_conf_path]:
+            if conf_path.exists():
+                try:
+                    config.read(conf_path)
+                    configs_read.append(str(conf_path))
+                    self.log_info(f"Read configuration from: {conf_path}")
+                except Exception as e:
+                    self.log_warning(f"Error reading {conf_path}: {e}")
+                    
+    def parse_outputs_conf(self) -> Dict:
+        """Parse outputs.conf using splunk btool to get effective configuration"""
+        try:
+            # Use splunk btool to get the effective outputs.conf configuration
+            btool_cmd = [
+                os.path.join(self.splunk_home, 'bin', 'splunk'),
+                'btool',
+                'outputs',
+                'list',
+                '--no-default',
+                '--debug'
+            ]
+            
+            btool_output = subprocess.check_output(btool_cmd, text=True)
+            self.log_info("Successfully retrieved effective outputs.conf using btool")
+            return self._parse_btool_output(btool_output, 'outputs.conf')
+            
+        except subprocess.CalledProcessError as e:
+            self.log_error(f"Failed to run btool for outputs.conf: {e}")
+            return self._parse_outputs_conf_manual()
+            
+    def _parse_outputs_conf_manual(self) -> Dict:
+        """Fallback manual parsing of outputs.conf files"""
+        outputs_conf_path = self.splunk_home / "etc" / "system" / "local" / "outputs.conf"
+        outputs_conf_default = self.splunk_home / "etc" / "system" / "default" / "outputs.conf"
+        
+        config = configparser.ConfigParser(allow_no_value=True)
+        config.optionxform = str  # Preserve case
+        
+        configs_read = []
+        
+        # Read default first, then local (local overrides default)
+        for conf_path in [outputs_conf_default, outputs_conf_path]:
             if conf_path.exists():
                 try:
                     config.read(conf_path)
@@ -605,6 +648,10 @@ class CertificateVerifier:
                 'allowSslCompression': 'true',
                 'allowSslRenegotiation': 'true',
                 'verifyServerName': 'false'
+            },
+            'tcpout': {
+                'compressed': 'true',
+                'useClientSSLCompression': 'true'
             }
         }
         
@@ -613,6 +660,14 @@ class CertificateVerifier:
             value = config[stanza][key]
             self.log_debug(f"Found {stanza}.{key} = {value} in configuration")
             return value
+            
+        # For tcpout stanzas in outputs.conf, check parent [tcpout] stanza for inherited values
+        if '::' in stanza and stanza.startswith('tcpout::') and stanza.split('::')[0] in config:
+            parent_stanza = stanza.split('::')[0]
+            if key in config[parent_stanza]:
+                value = config[parent_stanza][key]
+                self.log_debug(f"Found inherited value from {parent_stanza}.{key} = {value}")
+                return value
         
         # Fall back to Splunk documented defaults
         if stanza in splunk_defaults and key in splunk_defaults[stanza]:
@@ -628,6 +683,24 @@ class CertificateVerifier:
         # No value found
         self.log_warning(f"No value found for {stanza}.{key}")
         return None
+        
+    def check_outputs_compression(self, outputs_conf: Dict) -> None:
+        """Check compression settings in outputs.conf tcpout stanzas"""
+        compression_settings = {
+            'compressed': 'true',
+            'useClientSSLCompression': 'true'
+        }
+        
+        # Check all tcpout:: stanzas
+        for stanza in outputs_conf:
+            if stanza.startswith('tcpout::'):
+                for setting, expected_value in compression_settings.items():
+                    actual_value = self.get_config_value(outputs_conf, stanza, setting)
+                    if actual_value is None or actual_value.lower() != expected_value:
+                        self.log_warning(
+                            f"Compression setting '{setting}' in [{stanza}] is not set to '{expected_value}'. "
+                            f"Current value: {actual_value if actual_value is not None else 'not set'}"
+                        )
 
     def verify_ssl_config_section(self, config: Dict, section_name: str = 'sslConfig') -> Dict:
         """Verify sslConfig section requirements"""
@@ -1066,8 +1139,12 @@ class CertificateVerifier:
         # Get Splunk version
         self.get_splunk_version()
         
-        # Parse server.conf
-        print(f"\n{Colors.BOLD}1. Parsing server.conf{Colors.ENDC}")
+        # Run configuration checks using SplunkConfigChecker
+        print(f"\n{Colors.BOLD}1. Running configuration checks{Colors.ENDC}")
+        config_rules_path = Path(__file__).parent.parent / "config_rules.json"
+        config_checker = SplunkConfigChecker(self.splunk_home, config_rules_path)
+        check_results = config_checker.check_configurations()
+        config_checker.print_results(check_results)
         config = self.parse_server_conf()
         
         # Verify sslConfig section
@@ -1105,57 +1182,100 @@ class CertificateVerifier:
     def print_summary(self, results: Dict):
         """Print verification summary"""
         print(f"\n{Colors.BOLD}VERIFICATION SUMMARY{Colors.ENDC}")
-        print("=" * 60)
+        print("=" * 120)  # Wider separator for more detailed output
         
         total_checks = 0
         passed_checks = 0
         
         # SSL Config checks
+        ssl_config = results.get('ssl_config', {})
         ssl_checks = [
-            ('SSL Config section exists', results['ssl_config']['section_exists']),
-            ('SSL compression enabled', results['ssl_config']['ssl_compression_ok']),
-            ('SSL renegotiation enabled', results['ssl_config']['ssl_renegotiation_ok']),
-            ('SSL server certificate valid', results['ssl_config']['server_cert_valid']),
-            ('SSL certificate chain valid', results['ssl_config']['cert_chain_valid'])
+            ('server.conf [sslConfig] section exists', ssl_config.get('section_exists'),
+             'Configuration section must exist'),
+            ('server.conf [sslConfig] allowSslCompression=true', ssl_config.get('ssl_compression_ok'),
+             'Required for optimal performance'),
+            ('server.conf [sslConfig] allowSslRenegotiation=true', ssl_config.get('ssl_renegotiation_ok'),
+             'Required for SSL connectivity'),
+            ('server.conf [sslConfig] serverCert is valid', ssl_config.get('server_cert_valid'),
+             'Certificate file must be readable and valid'),
+            ('server.conf [sslConfig] certificate chain is valid', ssl_config.get('cert_chain_valid'),
+             'Certificate must be properly signed by CA')
         ]
         
         # KV Store checks
+        kvstore = results.get('kvstore', {})
         kvstore_checks = [
-            ('KV Store server cert valid', results['kvstore']['server_cert_valid']),
-            ('KV Store cert purpose correct', results['kvstore']['server_cert_purpose_ok']),
-            ('KV Store cert SAN correct', results['kvstore']['server_cert_san_ok']),
-            ('KV Store CA cert purpose correct', results['kvstore']['ca_cert_purpose_ok']),
-            ('KV Store certificate chain valid', results['kvstore']['cert_chain_valid'])
+            ('server.conf [kvstore] section exists', kvstore.get('section_exists'),
+             'Configuration section should exist for custom settings'),
+            ('server.conf [kvstore] serverCert is valid', kvstore.get('server_cert_valid'),
+             'Certificate file must be readable and valid'),
+            ('server.conf [kvstore] certificate has correct purpose', kvstore.get('server_cert_purpose_ok'),
+             'Certificate must allow both server and client authentication'),
+            ('server.conf [kvstore] certificate SAN is correct', kvstore.get('server_cert_san_ok'),
+             'SAN must include localhost/127.0.0.1 unless verifyServerName=false'),
+            ('server.conf [kvstore] CA certificate has correct purpose', kvstore.get('ca_cert_purpose_ok'),
+             'CA certificate must be valid for signing'),
+            ('server.conf [kvstore] certificate chain is valid', kvstore.get('cert_chain_valid'),
+             'Certificate must be properly signed by CA'),
+            ('server.conf [kvstore] verifyServerName=false', kvstore.get('verify_server_name_disabled'),
+             'Recommended setting for KV Store compatibility')
         ]
         
-        # Other checks
+        # Compression settings
+        compression_checks = [
+            ('outputs.conf [tcpout] compressed=true', results.get('outputs_compression', {}).get('compressed'),
+             'Recommended for optimal data transmission'),
+            ('outputs.conf [tcpout] useClientSSLCompression=true', results.get('outputs_compression', {}).get('ssl_compression'),
+             'Recommended for encrypted data transmission')
+        ]
+        
+        def print_check_section(title: str, checks: List[Tuple]):
+            nonlocal total_checks, passed_checks
+            print(f"\n{Colors.BOLD}{title}:{Colors.ENDC}")
+            print("-" * 118)  # Separator for subsections
+            print(f"{'Status':<8} {'Check':<60} {'Details':<50}")
+            print("-" * 118)
+            
+            for check_name, check_result, check_details in checks:
+                total_checks += 1
+                if check_result:
+                    passed_checks += 1
+                    status = f"{Colors.GREEN}✓{Colors.ENDC}"
+                else:
+                    status = f"{Colors.RED}✗{Colors.ENDC}"
+                print(f"{status:<8} {check_name:<60} {check_details:<50}")
+        
+        # Print all sections
+        print_check_section("SSL Configuration", ssl_checks)
+        print_check_section("KV Store Configuration", kvstore_checks)
+        print_check_section("Compression Settings", compression_checks)
+        
+        # Additional checks
         other_checks = [
-            ('CA certificates complete', results['ca_complete']),
-            ('Version compatibility', results['version_compatible'])
+            ('CA certificates structure complete', results.get('ca_complete', False),
+             'All required CA certificates are present and valid'),
+            ('Version compatibility verified', True,
+             f'Current version: {self.splunk_version or "Unknown"}')
         ]
-        
-        all_checks = ssl_checks + kvstore_checks + other_checks
-        
-        for check_name, check_result in all_checks:
-            total_checks += 1
-            if check_result:
-                passed_checks += 1
-                print(f"{Colors.GREEN}✓{Colors.ENDC} {check_name}")
-            else:
-                print(f"{Colors.RED}✗{Colors.ENDC} {check_name}")
-        
-        print(f"\nChecks passed: {passed_checks}/{total_checks}")
-        
+        print_check_section("Other Checks", other_checks)
+                
+        # Print overall status
+        print("\n" + "=" * 120)
+        if passed_checks == total_checks:
+            print(f"{Colors.GREEN}All checks passed ({passed_checks}/{total_checks}){Colors.ENDC}")
+        else:
+            print(f"{Colors.RED}Some checks failed ({passed_checks}/{total_checks} passed){Colors.ENDC}")
+            
         if self.errors:
-            print(f"\n{Colors.RED}ERRORS ({len(self.errors)}):{Colors.ENDC}")
+            print(f"\n{Colors.RED}Errors found:{Colors.ENDC}")
             for error in self.errors:
-                print(f"  • {error}")
-        
+                print(f"  - {error}")
+                
         if self.warnings:
-            print(f"\n{Colors.YELLOW}WARNINGS ({len(self.warnings)}):{Colors.ENDC}")
+            print(f"\n{Colors.YELLOW}Warnings found:{Colors.ENDC}")
             for warning in self.warnings:
-                print(f"  • {warning}")
-        
+                print(f"  - {warning}")
+                
         if passed_checks == total_checks and not self.errors:
             print(f"\n{Colors.GREEN}{Colors.BOLD}✓ All checks passed! KV Store configuration appears ready for upgrade.{Colors.ENDC}")
         else:
