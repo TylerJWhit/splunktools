@@ -1,114 +1,79 @@
-# Splunk Configuration Checker
+# Splunk Tools Collection
 
+A collection of tools for Splunk administration, configuration management, and validation.
+
+## Tools Overview
+
+### KV Store Certificate Verifier (`kvcertverify/`)
+A tool to verify KV Store certificate configurations for safe upgrades from Splunk KV Store 4/4.2 to 7.
+- Checks SSL configuration settings
+- Validates certificate chains
+- Verifies compression settings
+- Ensures upgrade compatibility
+
+[Learn more about KV Store Certificate Verifier](kvcertverify/README.md)
+
+### Splunk Config Checker (`splunk_config_checker/`)
 A generic configuration checker for Splunk configurations that verifies settings across different conf files using rules defined in JSON.
+- Flexible rule-based configuration validation
+- Supports multiple Splunk configuration files
+- Custom severity levels and messages
+- Detailed reporting
 
-## Overview
+[Learn more about Splunk Config Checker](splunk_config_checker/README.md)
 
-The Splunk Configuration Checker is a flexible tool that allows you to:
+### User Permissions Tools
+- `splk_user_perms.py` - Check and manage Splunk user permissions
+- `splk_user_perms_3.6.py` - Python 3.6 compatible version of the permissions tool
 
-- Define configuration checks in a JSON file
-- Check settings across multiple Splunk configuration files
-- Set different severity levels for checks (INFO, WARN, ERROR)
-- Provide custom messages for failed checks
-- Handle inheritance in Splunk configurations (e.g., tcpout stanza defaults)
+### Utility Scripts
+- `find_duplicate_inputs.sh` - Identify duplicate input configurations
+- `lookup_gen.sh` - Generate Splunk lookup files
+- `testpeers.sh` - Test Splunk peer connections
+- `New-LogEvent.ps1` - PowerShell script for creating Windows event log entries
 
-## Usage
+## Installation
 
-### Basic Usage
+Most tools can be run directly from their respective directories. Some tools require Splunk's Python interpreter:
 
-1. Define your configuration rules in `config_rules.json`:
-
-```json
-{
-    "rules": [
-        {
-            "filename": "outputs",
-            "stanza": "tcpout",
-            "setting": "compressed",
-            "expected_value": true,
-            "level": "WARN",
-            "message": "Data compression should be enabled for tcpout"
-        }
-    ]
-}
+```bash
+$SPLUNK_HOME/bin/python <script_name>.py [arguments]
 ```
 
-2. Use the checker in your code:
+## Requirements
 
+- Splunk Enterprise installation
+- Splunk's Python interpreter (for Python-based tools)
+- PowerShell (for PS1 scripts)
+- Bash shell (for shell scripts)
+
+## Common Usage
+
+### KV Store Certificate Verifier
+```bash
+cd kvcertverify
+$SPLUNK_HOME/bin/python kv_cert_verifier.py $SPLUNK_HOME
+```
+
+### Configuration Checker
 ```python
 from splunk_config_checker import SplunkConfigChecker
 from pathlib import Path
 
-splunk_home = Path("/opt/splunk")
-rules_file = Path("config_rules.json")
-
-checker = SplunkConfigChecker(splunk_home, rules_file)
+checker = SplunkConfigChecker(
+    splunk_home=Path("/opt/splunk"),
+    rules_file=Path("splunk_config_checker/config_rules.json")
+)
 results = checker.check_configurations()
 checker.print_results(results)
 ```
 
-### Rule Format
-
-Each rule in the JSON file must include:
-
-- `filename`: The Splunk configuration file name without .conf extension
-- `stanza`: The configuration stanza name
-- `setting`: The configuration setting key
-- `expected_value`: The expected value for the setting
-- `level` (optional): Severity level - "INFO", "WARN", or "ERROR" (default: "WARN")
-- `message` (optional): Custom message to display when check fails
-
-### Example Rules
-
-```json
-{
-    "rules": [
-        {
-            "filename": "outputs",
-            "stanza": "tcpout",
-            "setting": "compressed",
-            "expected_value": true,
-            "level": "WARN",
-            "message": "Data compression should be enabled for tcpout"
-        },
-        {
-            "filename": "server",
-            "stanza": "sslConfig",
-            "setting": "allowSslCompression",
-            "expected_value": true,
-            "level": "WARN"
-        }
-    ]
-}
+### User Permissions Check
+```bash
+$SPLUNK_HOME/bin/python splk_user_perms.py --user admin
 ```
 
-## Special Handling
 
-### Stanza Inheritance
+## Authors
 
-The checker handles special cases like tcpout stanza inheritance in outputs.conf:
-
-- If a setting is not found in a `tcpout::` stanza, it will check the parent `tcpout` stanza
-- This follows Splunk's configuration inheritance rules
-
-### Value Types
-
-The checker supports different value types:
-
-- Strings: `"expected_value": "value"`
-- Booleans: `"expected_value": true`
-- Numbers: `"expected_value": 8089`
-
-Values are compared case-insensitively for boolean values ("true"/"false").
-
-## Adding New Rules
-
-To add new configuration checks:
-
-1. Open `config_rules.json`
-2. Add a new rule object to the `rules` array
-3. Include all required fields (filename, stanza, setting, expected_value)
-4. Add optional fields (level, message) as needed
-5. Save the file
-
-The checker will automatically pick up and verify the new rules.
+- Tyler Ezell - Initial work and maintenance

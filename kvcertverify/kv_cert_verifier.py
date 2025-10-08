@@ -1141,7 +1141,7 @@ class CertificateVerifier:
         
         # Run configuration checks using SplunkConfigChecker
         print(f"\n{Colors.BOLD}1. Running configuration checks{Colors.ENDC}")
-        config_rules_path = Path(__file__).parent.parent / "config_rules.json"
+        config_rules_path = Path(__file__).parent.parent / "splunk_config_checker" / "config_rules.json"
         config_checker = SplunkConfigChecker(self.splunk_home, config_rules_path)
         check_results = config_checker.check_configurations()
         config_checker.print_results(check_results)
